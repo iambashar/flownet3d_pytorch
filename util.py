@@ -208,7 +208,7 @@ def sample_and_group_all(xyz, points):
     return new_xyz, new_points
 
 class PointNetSetAbstraction(nn.Module):
-    def __init__(self, npoint, radius, nsample, in_channel, mlp, mlp2 = None, group_all = False):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp, mlp2 = [], group_all = False):
         super(PointNetSetAbstraction, self).__init__()
         self.npoint = npoint
         self.radius = radius

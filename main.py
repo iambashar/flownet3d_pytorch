@@ -15,7 +15,7 @@ from data import ModelNet40, SceneflowDataset
 from model import FlowNet3D
 import numpy as np
 from torch.utils.data import DataLoader
-# from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 
@@ -152,9 +152,16 @@ def train(args, net, train_loader, test_loader, boardio, textio):
         textio.cprint('==epoch: %d, learning rate: %f=='%(epoch, opt.param_groups[0]['lr']))
         train_loss = train_one_epoch(args, net, train_loader, opt)
         textio.cprint('mean train EPE loss: %f'%train_loss)
+        boardio.add_scalar('train/loss', train_loss, epoch)
+        boardio.add_scalar('train/lr', opt.param_groups[0]['lr'], epoch)
 
         test_loss, epe, acc, acc_2 = test_one_epoch(args, net, test_loader)
         textio.cprint('mean test loss: %f\tEPE 3D: %f\tACC 3D: %f\tACC 3D 2: %f'%(test_loss, epe, acc, acc_2))
+        boardio.add_scalar('test/loss', test_loss, epoch)
+        boardio.add_scalar('test/epe', epe, epoch)
+        boardio.add_scalar('test/acc', acc, epoch)
+        boardio.add_scalar('test/acc_2', acc_2, epoch)
+
         if best_test_loss >= test_loss:
             best_test_loss = test_loss
             textio.cprint('best test loss till now: %f'%test_loss)
@@ -211,10 +218,12 @@ def main():
     parser.add_argument('--dataset', type=str, default='SceneflowDataset',
                         choices=['SceneflowDataset'], metavar='N',
                         help='dataset to use')
-    parser.add_argument('--dataset_path', type=str, default='../../datasets/data_processed_maxcut_35_20k_2k_8192', metavar='N',
+    parser.add_argument('--dataset_path', type=str, default='Data/data_processed_maxcut_35_20k_2k_8192', metavar='N',
                         help='dataset to use')
     parser.add_argument('--model_path', type=str, default='', metavar='N',
                         help='Pretrained model path')
+    parser.add_argument('--num_workers', type=int, default=8, metavar='N',
+                        help='number of workers to train ')
 
     args = parser.parse_args()
     # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
@@ -224,8 +233,8 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
-    # boardio = SummaryWriter(log_dir='checkpoints/' + args.exp_name)
-    boardio = []
+    boardio = SummaryWriter(log_dir='runs/' + args.exp_name)
+    # boardio = []
     _init_(args)
 
     textio = IOStream('checkpoints/' + args.exp_name + '/run.log')
@@ -235,18 +244,18 @@ def main():
         train_loader = DataLoader(
             ModelNet40(num_points=args.num_points, partition='train', gaussian_noise=args.gaussian_noise,
                        unseen=args.unseen, factor=args.factor),
-            batch_size=args.batch_size, shuffle=True, drop_last=True)
+            batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers)
         test_loader = DataLoader(
             ModelNet40(num_points=args.num_points, partition='test', gaussian_noise=args.gaussian_noise,
                        unseen=args.unseen, factor=args.factor),
-            batch_size=args.test_batch_size, shuffle=False, drop_last=False)
+            batch_size=args.test_batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers)
     elif args.dataset == 'SceneflowDataset':
         train_loader = DataLoader(
             SceneflowDataset(npoints=args.num_points, root = args.dataset_path, partition='train'),
-            batch_size=args.batch_size, shuffle=True, drop_last=True)
+            batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers)
         test_loader = DataLoader(
             SceneflowDataset(npoints=args.num_points, root = args.dataset_path, partition='test'),
-            batch_size=args.test_batch_size, shuffle=False, drop_last=False)
+            batch_size=args.test_batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers)
     else:
         raise Exception("not implemented")
 
@@ -254,7 +263,7 @@ def main():
         net = FlowNet3D(args).cuda()
         net.apply(weights_init)
         if args.eval:
-            if args.model_path is '':
+            if args.model_path == '':
                 model_path = 'checkpoints' + '/' + args.exp_name + '/models/model.best.t7'
             else:
                 model_path = args.model_path
@@ -275,7 +284,7 @@ def main():
 
 
     print('FINISH')
-    # boardio.close()
+    boardio.close()
 
 
 if __name__ == '__main__':

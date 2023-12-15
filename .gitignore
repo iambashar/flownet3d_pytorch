@@ -5,3 +5,6 @@ build/
 dist/
 pointnet2.egg-info/
 experiment/
+Data/
+playground.ipynb
+runs/
