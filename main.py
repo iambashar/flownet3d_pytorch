@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-
 from __future__ import print_function
 import os
 import gc
@@ -11,13 +7,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR, StepLR
-from data import ModelNet40, SceneflowDataset
+from data import ModelNet40, SceneflowDataset, SceneflowDataset_Kitti
 from model import FlowNet3D
 import numpy as np
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
+import util
+import open3d as o3d
+import sys
+import matplotlib.pyplot as plt
+import cv2
 
 class IOStream:
     def __init__(self, path):
@@ -76,31 +76,44 @@ def test_one_epoch(args, net, test_loader):
     total_acc3d_2 = 0
     num_examples = 0
     for i, data in tqdm(enumerate(test_loader), total = len(test_loader)):
-        pc1, pc2, color1, color2, flow, mask1 = data
+        pc1, pc2, color1, color2, flow, mask1 = None, None, None, None, None, None
+        if args.dataset == 'SceneflowDataset':
+            pc1, pc2, color1, color2, flow, mask1 = data
+            flow = flow.cuda().transpose(2,1).contiguous()
+            mask1 = mask1.cuda().float()
+        elif args.dataset == 'Kitti':
+            pc, co = data
+            pc1 = pc[:, 0, :, :]
+            pc2 = pc[:, 1, :, :]
+            color1 = co[:, 0, :, :]
+            color2 = co[:, 1, :, :]
+            pc1 = pc1.float()
+            pc2 = pc2.float()
+            color1 = color1.float()
+            color2 = color2.float()
         pc1 = pc1.cuda().transpose(2,1).contiguous()
         pc2 = pc2.cuda().transpose(2,1).contiguous()
         color1 = color1.cuda().transpose(2,1).contiguous()
         color2 = color2.cuda().transpose(2,1).contiguous()
-        flow = flow.cuda()
-        mask1 = mask1.cuda().float()
+
 
         batch_size = pc1.size(0)
         num_examples += batch_size
         flow_pred = net(pc1, pc2, color1, color2).permute(0,2,1)
-        loss = torch.mean(mask1 * torch.sum((flow_pred - flow) * (flow_pred - flow), -1) / 2.0)
-        epe_3d, acc_3d, acc_3d_2 = scene_flow_EPE_np(flow_pred.detach().cpu().numpy(), flow.detach().cpu().numpy(), mask1.detach().cpu().numpy())
+        # loss = torch.mean(mask1 * torch.sum((flow_pred - flow) * (flow_pred - flow), -1) / 2.0)
+        epe_3d, acc_3d, acc_3d_2 = scene_flow_EPE_np(flow_pred.detach().cpu().numpy(), flow, mask1)
         total_epe += epe_3d * batch_size
         total_acc3d += acc_3d * batch_size
         total_acc3d_2+=acc_3d_2*batch_size
         # print('batch EPE 3D: %f\tACC 3D: %f\tACC 3D 2: %f' % (epe_3d, acc_3d, acc_3d_2))
 
-        total_loss += loss.item() * batch_size
+        # total_loss += loss.item() * batch_size
         
 
     return total_loss * 1.0 / num_examples, total_epe * 1.0 / num_examples, total_acc3d * 1.0 / num_examples, total_acc3d_2 * 1.0 / num_examples
 
 
-def train_one_epoch(args, net, train_loader, opt):
+def _train_one_epoch(args, net, train_loader, opt):   # FlowNet3D
     net.train()
     num_examples = 0
     total_loss = 0
@@ -118,6 +131,109 @@ def train_one_epoch(args, net, train_loader, opt):
         num_examples += batch_size
         flow_pred = net(pc1, pc2, color1, color2)
         loss = torch.mean(mask1 * torch.sum((flow_pred - flow) ** 2, 1) / 2.0)
+        loss.backward()
+
+        opt.step()
+        total_loss += loss.item() * batch_size
+
+        # if (i+1) % 100 == 0:
+        #     print("batch: %d, mean loss: %f" % (i, total_loss / 100 / batch_size))
+        #     total_loss = 0
+    return total_loss * 1.0 / num_examples
+
+def pcd_vis (grouped_xyz):
+    grouped_xyz_vis = grouped_xyz.cpu().detach().numpy()
+    grouped_xyz_vis = grouped_xyz_vis[0]
+    grouped_xyz_vis = grouped_xyz_vis.transpose(1, 0)
+    grouped_xyz_vis = grouped_xyz_vis[:, :3]
+    grouped_xyz_vis = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(grouped_xyz_vis))
+    grouped_xyz_vis = np.asarray(grouped_xyz_vis.points)
+    return grouped_xyz_vis
+
+def train_one_epoch(args, net, train_loader, opt):   # Just Go with Flow: Cycle-loss + KNN loss
+    net.train()
+    num_examples = 0
+    total_loss = 0
+    for i, data in tqdm(enumerate(train_loader), total = len(train_loader)):
+        pc1, pc2, color1, color2, flow, mask1 = None, None, None, None, None, None
+        if args.dataset == 'SceneflowDataset':
+            pc1, pc2, color1, color2, flow, mask1 = data
+            flow = flow.cuda().transpose(2,1).contiguous()
+            mask1 = mask1.cuda().float()
+        elif args.dataset == 'Kitti':
+            pc, co = data
+            pc1 = pc[:, 0, :, :]
+            pc2 = pc[:, 1, :, :]
+            color1 = co[:, 0, :, :]
+            color2 = co[:, 1, :, :]
+            pc1 = pc1.float()
+            pc2 = pc2.float()
+            color1 = color1.float()
+            color2 = color2.float()
+
+
+        pc1 = pc1.cuda().transpose(2,1).contiguous()
+        pc2 = pc2.cuda().transpose(2,1).contiguous()
+        color1 = color1.cuda().transpose(2,1).contiguous()
+        color2 = color2.cuda().transpose(2,1).contiguous()
+
+        batch_size = pc1.size(0)
+        opt.zero_grad()
+        num_examples += batch_size
+        forward_flow_pred = net(pc1, pc2, color1, color2)
+
+        forward_pc1 = pc1 + forward_flow_pred
+
+        _, knn_idx = util.knn_point(1, pc2.view(batch_size, -1, 3), forward_pc1.view(batch_size, -1, 3))
+        knn_idx = knn_idx[:, :, 0]
+
+
+        grouped_xyz = util.index_points(pc2.view(batch_size, -1, 3), knn_idx)
+        grouped_xyz = grouped_xyz.view(batch_size, 3, -1)              
+
+        loss_nn = torch.mean(torch.sum((grouped_xyz - forward_pc1) ** 2, 1) / 2.0)
+
+        anchor_point = (grouped_xyz + forward_pc1) * 0.5
+
+        backward_flow_pred = net(anchor_point, pc1, color2, color1)
+
+        backward_pc2 = anchor_point + backward_flow_pred
+
+        # Display using matplotlib:
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        grouped_xyz_vis = pcd_vis(grouped_xyz)
+        pc1_vis = pcd_vis(pc1)
+        forward_pc1_vis = pcd_vis(forward_pc1)
+        pc2_vis = pcd_vis(pc2)
+        # anchor_point_vis = pcd_vis(anchor_point)
+        # backward_pc2_vis = pcd_vis(backward_pc2)
+        # ax.scatter3D(backward_pc2_vis[:, 0], backward_pc2_vis[:, 1], backward_pc2_vis[:, 2], c='r', marker='o')
+        # ax.scatter3D(anchor_point_vis[:, 0], anchor_point_vis[:, 1], anchor_point_vis[:, 2], c='r', marker='o')
+        # ax.scatter3D(grouped_xyz_vis[:, 0], grouped_xyz_vis[:, 1], grouped_xyz_vis[:, 2], c='r', marker='o')
+        # ax.scatter3D(pc1_vis[:, 0], pc1_vis[:, 1], pc1_vis[:, 2], c='b', marker='o')
+        # ax.scatter3D(pc2_vis[:, 0], pc2_vis[:, 1], pc2_vis[:, 2], c='r', marker='o')
+        # ax.scatter3D(forward_pc1_vis[:, 0], forward_pc1_vis[:, 1], forward_pc1_vis[:, 2], c='g', marker='o')
+
+        gt_flow = pc1 + flow
+        gt_flow_vis = pcd_vis(gt_flow)
+
+        pcd_np = np.asarray(pc1_vis)
+        pc2_np = np.asarray(pc2_vis)
+        gt_flow_np = np.asarray(gt_flow_vis)
+        forward_pc1_np = np.asarray(forward_pc1_vis)
+        ax.quiver(pcd_np[:, 0], pcd_np[:, 1], pcd_np[:, 2], gt_flow_np[:, 0], gt_flow_np[:, 1], gt_flow_np[:, 2], length=0.1, color = 'r')
+        # ax.quiver(pcd_np[:, 0], pcd_np[:, 1], pcd_np[:, 2], pc2_np[:, 0], pc2_np[:, 1], pc2_np[:, 2], length=0.1)
+        ax.quiver(pcd_np[:, 0], pcd_np[:, 1], pcd_np[:, 2], forward_pc1_np[:, 0], forward_pc1_np[:, 1], forward_pc1_np[:, 2], length=0.1, color = 'g')
+
+        # ax.set_title("Scene Flow Vectors")
+        plt.show()
+        sys.exit()
+
+        loss_cycle = torch.mean(torch.sum((pc1 - backward_pc2) ** 2, 1) / 2.0)
+
+        loss = loss_nn + loss_cycle
+
         loss.backward()
 
         opt.step()
@@ -216,7 +332,7 @@ def main():
     parser.add_argument('--unseen', type=bool, default=False, metavar='N',
                         help='Whether to test on unseen category')
     parser.add_argument('--dataset', type=str, default='SceneflowDataset',
-                        choices=['SceneflowDataset'], metavar='N',
+                        choices=['SceneflowDataset', 'Kitti'], metavar='N',
                         help='dataset to use')
     parser.add_argument('--dataset_path', type=str, default='Data/data_processed_maxcut_35_20k_2k_8192', metavar='N',
                         help='dataset to use')
@@ -224,6 +340,8 @@ def main():
                         help='Pretrained model path')
     parser.add_argument('--num_workers', type=int, default=8, metavar='N',
                         help='number of workers to train ')
+    parser.add_argument('--resume', action='store_true', default=False,
+                        help='Resume training')                        
 
     args = parser.parse_args()
     # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
@@ -251,10 +369,17 @@ def main():
             batch_size=args.test_batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers)
     elif args.dataset == 'SceneflowDataset':
         train_loader = DataLoader(
-            SceneflowDataset(npoints=args.num_points, root = args.dataset_path, partition='train'),
+            SceneflowDataset(npoints=args.num_points, partition='train'),
+            batch_size=args.batch_size, shuffle=False, drop_last=True, num_workers=args.num_workers)
+        test_loader = DataLoader(
+            SceneflowDataset(npoints=args.num_points, partition='test'),
+            batch_size=args.test_batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers)
+    elif args.dataset == 'Kitti':
+        train_loader = DataLoader(
+            SceneflowDataset_Kitti(npoints=args.num_points, train=True),
             batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=args.num_workers)
         test_loader = DataLoader(
-            SceneflowDataset(npoints=args.num_points, root = args.dataset_path, partition='test'),
+            SceneflowDataset_Kitti(npoints=args.num_points, train=False),
             batch_size=args.test_batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers)
     else:
         raise Exception("not implemented")
@@ -277,6 +402,14 @@ def main():
             print("Let's use", torch.cuda.device_count(), "GPUs!")
     else:
         raise Exception('Not implemented')
+
+    if args.resume:
+        print("Resume training from checkpoint...")
+        net.load_state_dict(torch.load(args.model_path), strict=False)
+        if torch.cuda.device_count() > 1:
+            net = nn.DataParallel(net)
+            print("Let's use", torch.cuda.device_count(), "GPUs!")
+
     if args.eval:
         test(args, net, test_loader, boardio, textio)
     else:
